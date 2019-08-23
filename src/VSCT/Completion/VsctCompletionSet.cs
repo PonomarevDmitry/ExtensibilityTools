@@ -1,57 +1,37 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Collections.Specialized;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using Microsoft.VisualStudio.Language.Intellisense;
+﻿using Microsoft.VisualStudio.Language.Intellisense;
 using Microsoft.VisualStudio.Text;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace MadsKristensen.ExtensibilityTools.Vsct
 {
     class VsctCompletionSet : CompletionSet
     {
-        readonly List<Completion> _allCompletions;
-        List<Completion> _filteredCompletions;
+        private readonly List<Completion> _allCompletions;
 
         public VsctCompletionSet(string moniker, string displayName, ITrackingSpan applicableTo, List<Completion> completions, IEnumerable<Completion> completionBuilders)
             : base(moniker, displayName, applicableTo, completions, completionBuilders)
         {
             _allCompletions = completions;
-            _filteredCompletions = completions;
-        }
-
-        public override IList<Completion> Completions
-        {
-            get
-            {
-                return _filteredCompletions;
-            }
         }
 
         public override void SelectBestMatch()
         {
             ITextSnapshot snapshot = ApplicableTo.TextBuffer.CurrentSnapshot;
-            string typedText = ApplicableTo.GetText(snapshot).Trim();
+            string typedText = ApplicableTo.GetText(snapshot);
 
             if (string.IsNullOrWhiteSpace(typedText))
             {
-                if (_filteredCompletions.Any())
-                    SelectionStatus = new CompletionSelectionStatus(_filteredCompletions.First(), true, true);
+                if (this.WritableCompletions.Any())
+                    SelectionStatus = new CompletionSelectionStatus(WritableCompletions.First(), true, true);
 
                 return;
-            }   
+            }
 
-            foreach (Completion comp in _filteredCompletions)
+            foreach (Completion comp in WritableCompletions)
             {
-                int index = comp.DisplayText.IndexOf(typedText, StringComparison.OrdinalIgnoreCase);
-
-                if (index == 0)
-                {
-                    SelectionStatus = new CompletionSelectionStatus(comp, true, true);
-                    return;
-                }
-                else if (index > -1)
+                if (comp.DisplayText.IndexOf(typedText, StringComparison.InvariantCultureIgnoreCase) > -1)
                 {
                     SelectionStatus = new CompletionSelectionStatus(comp, true, true);
                     return;
@@ -62,18 +42,33 @@ namespace MadsKristensen.ExtensibilityTools.Vsct
         public override void Filter()
         {
             ITextSnapshot snapshot = ApplicableTo.TextBuffer.CurrentSnapshot;
-            string typedText = ApplicableTo.GetText(snapshot).Trim();
+            string typedText = ApplicableTo.GetText(snapshot);
 
-            List<Completion> temp = new List<Completion>();
-
-            foreach (Completion comp in _allCompletions)
+            if (!string.IsNullOrEmpty(typedText))
             {
-                int index = comp.DisplayText.IndexOf(typedText, StringComparison.OrdinalIgnoreCase);
-                if (index > -1)
-                    temp.Add(comp);
-            }
+                List<Completion> temp = _allCompletions.Where(c => c.DisplayText.IndexOf(typedText, StringComparison.InvariantCultureIgnoreCase) > -1).ToList();
 
-            _filteredCompletions = temp;
+                if (temp.Any())
+                {
+                    this.WritableCompletions.BeginBulkOperation();
+
+                    this.WritableCompletions.Clear();
+
+                    this.WritableCompletions.AddRange(temp);
+
+                    this.WritableCompletions.EndBulkOperation();
+                }
+            }
+            else
+            {
+                this.WritableCompletions.BeginBulkOperation();
+
+                this.WritableCompletions.Clear();
+
+                this.WritableCompletions.AddRange(_allCompletions);
+
+                this.WritableCompletions.EndBulkOperation();
+            }
         }
     }
 }
