@@ -4,6 +4,7 @@ using System.CodeDom.Compiler;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -38,6 +39,7 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
 
         private const string DefaultGuidListClassName = "PackageGuids";
         private const string DefaultPkgCmdIDListClassName = "PackageIds";
+
         private const string ClassGuideListComment = "Helper class that exposes all GUIDs used across VS Package.";
         private const string ClassPkgCmdIDListComments = "Helper class that encapsulates all CommandIDs uses across VS Package.";
 
@@ -45,64 +47,86 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
 
         protected override string GenerateStringCode(string inputFileContent)
         {
-            string globalNamespaceName;
-            string guidListClassName;
-            string cmdIdListClassName;
-            string supporterPostfix;
-            bool isPublic;
-
             // get parameters passed as 'FileNamespace' inside properties of the file generator:
-            InterpreteArguments((string.IsNullOrEmpty(FileNamespace) ? null : FileNamespace.Split(';')),
-                                out globalNamespaceName, out guidListClassName, out cmdIdListClassName,
-                                out supporterPostfix, out isPublic);
+            InterpreteArguments(
+                string.IsNullOrEmpty(FileNamespace) ? null : FileNamespace.Split(';')
+                , out string globalNamespaceName
+                , out string guidListClassName
+                , out string cmdIdListClassName
+                , out string supporterPostfix
+                , out bool isPublic
+            );
+
+            string language = GetProject().CodeModel.Language;
+
+            var codeProvider = GetCodeProvider(language);
+
+            bool isCSharp = string.Equals(codeProvider.FileExtension, "cs", StringComparison.InvariantCultureIgnoreCase);
 
             // create support CodeDOM classes:
             var globalNamespace = new System.CodeDom.CodeNamespace(globalNamespaceName);
-            var classGuideList = CreateClass(guidListClassName, ClassGuideListComment, isPublic, true);
-            var classPkgCmdIDList = CreateClass(cmdIdListClassName, ClassPkgCmdIDListComments, isPublic, true);
-            IList<KeyValuePair<string, string>> guids;
-            IList<KeyValuePair<string, string>> ids;
+
+            var classGuideList = CreateClass(guidListClassName, ClassGuideListComment, isPublic, true, !isCSharp);
+
+            var classPkgCmdIDList = CreateClass(cmdIdListClassName, ClassPkgCmdIDListComments, isPublic, true, !isCSharp);
 
             // retrieve the list GUIDs and IDs defined inside VSCT file:
-            Parse(inputFileContent, out guids, out ids);
+            var guids = Parse(inputFileContent);
 
             // generate members describing GUIDs:
             if (guids != null)
             {
                 var delayedMembers = new List<CodeTypeMember>();
+
                 foreach (var symbol in guids)
                 {
                     string nameString;
                     string nameGuid;
 
                     // for each GUID generate one string and one GUID field with similar names:
-                    if (symbol.Key != null && symbol.Key.EndsWith(supporterPostfix, StringComparison.OrdinalIgnoreCase))
+                    if (symbol.Name != null && symbol.Name.EndsWith(supporterPostfix, StringComparison.OrdinalIgnoreCase))
                     {
-                        nameString = symbol.Key;
-                        nameGuid = symbol.Key.Substring(0, symbol.Key.Length - supporterPostfix.Length);;
+                        nameString = symbol.Name;
+                        nameGuid = symbol.Name.Substring(0, symbol.Name.Length - supporterPostfix.Length);
                     }
                     else
                     {
-                        nameString = symbol.Key + supporterPostfix;
-                        nameGuid = symbol.Key;
+                        nameString = symbol.Name + supporterPostfix;
+                        nameGuid = symbol.Name;
                     }
 
-                    classGuideList.Members.Add(CreateConstField("System.String", nameString, symbol.Value, true));
-                    delayedMembers.Add(CreateStaticField("Guid", nameGuid, nameString, true));
+                    classGuideList.Members.Add(CreateConstField(typeof(string), nameString, symbol.Value, true));
+
+                    delayedMembers.Add(CreateStaticField(typeof(Guid), nameGuid, nameString, true));
+
+                    if (symbol.Ids.Any())
+                    {
+                        if (classPkgCmdIDList.Members.Count > 0)
+                        {
+                            classPkgCmdIDList.Members.Add(new CodeSnippetTypeMember(string.Empty));
+                        }
+
+                        var classPkgCmdIDNested = CreateClass(nameGuid, string.Empty, isPublic, true, !isCSharp);
+
+                        classPkgCmdIDList.Members.Add(classPkgCmdIDNested);
+
+                        foreach (var id in symbol.Ids)
+                        {
+                            if (classPkgCmdIDNested.Members.Count > 0)
+                            {
+                                classPkgCmdIDNested.Members.Add(new CodeSnippetTypeMember(string.Empty));
+                            }
+
+                            classPkgCmdIDNested.Members.Add(CreateConstField(typeof(int), id.Item1, ToHex(id.Item2, language), false));
+                        }
+                    }
                 }
+
+                classGuideList.Members.Add(new CodeSnippetTypeMember(string.Empty));
 
                 foreach (var member in delayedMembers)
                 {
                     classGuideList.Members.Add(member);
-                }
-            }
-
-            // generate members describing IDs:
-            if (ids != null)
-            {
-                foreach (var i in ids)
-                {
-                    classPkgCmdIDList.Members.Add(CreateConstField("System.Int32", i.Key, ToHex(i.Value, GetProject().CodeModel.Language), false));
                 }
             }
 
@@ -112,13 +136,11 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
             globalNamespace.Comments.Add(new CodeCommentStatement("</auto-generated>"));
             globalNamespace.Comments.Add(new CodeCommentStatement("------------------------------------------------------------------------------"));
 
-            // add all members to final namespace:
-            globalNamespace.Imports.Add(new CodeNamespaceImport("System"));
             globalNamespace.Types.Add(classGuideList);
             globalNamespace.Types.Add(classPkgCmdIDList);
 
             // generate source code:
-            return GenerateFromNamespace(GetCodeProvider(), globalNamespace, false);
+            return GenerateFromNamespace(codeProvider, globalNamespace, false, isCSharp);
         }
 
         private void InterpreteArguments(string[] args, out string globalNamespaceName, out string guidClassName, out string cmdIdListClassName, out string supporterPostfix, out bool isPublic)
@@ -150,16 +172,33 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
 
         #region Parsing
 
+        private class PackageGuid
+        {
+            public string Name { get; private set; }
+
+            public string Value { get; private set; }
+
+            public List<Tuple<string, string>> Ids { get; private set; }
+
+            public PackageGuid(string name, string value)
+            {
+                this.Name = name;
+                this.Value = value;
+
+                this.Ids = new List<Tuple<string, string>>();
+            }
+        }
+
         /// <summary>
         /// Extract GUIDs and IDs descriptions from given XML content.
         /// </summary>
-        private static void Parse(string vsctContentFile, out IList<KeyValuePair<string, string>> guids, out IList<KeyValuePair<string, string>> ids)
+        private static List<PackageGuid> Parse(string vsctContentFile)
         {
-            var xml = new XmlDocument();
-            XmlElement symbols = null;
+            List<PackageGuid> result = new List<PackageGuid>();
 
-            guids = null;
-            ids = null;
+            var xml = new XmlDocument();
+
+            XmlElement symbols = null;
 
             try
             {
@@ -172,15 +211,12 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
             }
             catch
             {
-                return;
+                return result;
             }
 
             if (symbols != null)
             {
                 var guidSymbols = symbols.GetElementsByTagName("GuidSymbol");
-
-                guids = new List<KeyValuePair<string, string>>();
-                ids = new List<KeyValuePair<string, string>>();
 
                 foreach (XmlElement symbol in guidSymbols)
                 {
@@ -200,26 +236,31 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
                             value = "-invalid-";
                         }
 
-                        guids.Add(new KeyValuePair<string, string>(name, value));
+                        var guid = new PackageGuid(name, value);
+
+                        result.Add(guid);
+
+                        var idSymbols = symbol.GetElementsByTagName("IDSymbol");
+
+                        foreach (XmlElement i in idSymbols)
+                        {
+                            try
+                            {
+                                // go through all IDSymbol elements...
+                                guid.Ids.Add(Tuple.Create(i.Attributes["name"].Value, i.Attributes["value"].Value));
+                            }
+                            catch
+                            {
+                            }
+                        }
                     }
                     catch
                     {
                     }
-
-                    var idSymbols = symbol.GetElementsByTagName("IDSymbol");
-                    foreach (XmlElement i in idSymbols)
-                    {
-                        try
-                        {
-                            // go through all IDSymbol elements...
-                            ids.Add(new KeyValuePair<string, string>(i.Attributes["name"].Value, i.Attributes["value"].Value));
-                        }
-                        catch
-                        {
-                        }
-                    }
                 }
             }
+
+            return result;
         }
 
         #endregion
@@ -229,36 +270,47 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
         /// <summary>
         /// Creates new static/partial class definition.
         /// </summary>
-        private static CodeTypeDeclaration CreateClass(string name, string comment, bool isPublic, bool isPartial)
+        private static CodeTypeDeclaration CreateClass(string name, string comment, bool isPublic, bool isPartial, bool isSealed)
         {
             var item = new CodeTypeDeclaration(name);
-            
-            item.Comments.Add(new CodeCommentStatement("<summary>", true));
-            item.Comments.Add(new CodeCommentStatement(comment, true));
-            item.Comments.Add(new CodeCommentStatement("</summary>", true));
+
+            if (!string.IsNullOrEmpty(comment))
+            {
+                item.Comments.Add(new CodeCommentStatement("<summary>", true));
+                item.Comments.Add(new CodeCommentStatement(comment, true));
+                item.Comments.Add(new CodeCommentStatement("</summary>", true));
+            }
+
             item.IsClass = true;
-            item.IsPartial = true;
 
             // HINT: Sealed + Abstract => static class definition
             if (isPublic)
-                item.TypeAttributes = TypeAttributes.Sealed | TypeAttributes.Public;
+                item.TypeAttributes = TypeAttributes.Public;
             else
-                item.TypeAttributes = TypeAttributes.Sealed | TypeAttributes.NestedFamANDAssem;
+                item.TypeAttributes = TypeAttributes.NestedFamANDAssem;
+
+            if (isSealed)
+            {
+                item.TypeAttributes |= TypeAttributes.Sealed;
+            }
 
             item.IsPartial = isPartial;
 
             item.TypeAttributes |= TypeAttributes.BeforeFieldInit | TypeAttributes.Class;
+
             return item;
         }
 
         /// <summary>
         /// Creates new constant field with given name and value.
         /// </summary>
-        private static CodeMemberField CreateConstField(string type, string name, string value, bool fieldRef)
+        private static CodeMemberField CreateConstField(Type type, string name, string value, bool fieldRef)
         {
-            var item = new CodeMemberField(new CodeTypeReference(type), name);
+            var item = new CodeMemberField(type, name)
+            {
+                Attributes = MemberAttributes.Const | MemberAttributes.Public
+            };
 
-            item.Attributes = MemberAttributes.Const | MemberAttributes.Public;
             if (fieldRef)
             {
                 item.InitExpression = new CodePrimitiveExpression(value);
@@ -274,14 +326,16 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
         /// <summary>
         /// Creates new static/read-only field with given name and value.
         /// </summary>
-        private static CodeMemberField CreateStaticField(string type, string name, object value, bool fieldRef)
+        private static CodeMemberField CreateStaticField(Type type, string name, object value, bool fieldRef)
         {
-            var item = new CodeMemberField(new CodeTypeReference(type), name);
+            var item = new CodeMemberField(type, name);
+
             var param = fieldRef
                             ? (CodeExpression)new CodeSnippetExpression((string)value)
                             : new CodePrimitiveExpression(value);
+
             item.Attributes = MemberAttributes.Static | MemberAttributes.Public;
-            item.InitExpression = new CodeObjectCreateExpression(new CodeTypeReference(type), param);
+            item.InitExpression = new CodeObjectCreateExpression(type, param);
 
             return item;
         }
@@ -293,22 +347,34 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
         /// <summary>
         /// Generates source code from given namespace.
         /// </summary>
-        private static string GenerateFromNamespace(CodeDomProvider codeProvider, System.CodeDom.CodeNamespace codeNamespace, bool blankLinesBetweenMembers)
+        private static string GenerateFromNamespace(CodeDomProvider codeProvider, System.CodeDom.CodeNamespace codeNamespace, bool blankLinesBetweenMembers, bool isCSharp)
         {
             var result = new StringBuilder();
-            var writer = new StringWriter(result);
 
-            var options = new CodeGeneratorOptions();
-            options.BlankLinesBetweenMembers = blankLinesBetweenMembers;
-            options.ElseOnClosing = true;
-            options.VerbatimOrder = true;
-            options.BracingStyle = "C";
+            using (var writer = new StringWriter(result))
+            {
+                var options = new CodeGeneratorOptions
+                {
+                    BlankLinesBetweenMembers = blankLinesBetweenMembers,
+                    ElseOnClosing = true,
+                    VerbatimOrder = true,
+                    BracingStyle = "C",
+                };
 
-            // generate the code:
-            codeProvider.GenerateCodeFromNamespace(codeNamespace, writer, options);
+                // generate the code:
+                codeProvider.GenerateCodeFromNamespace(codeNamespace, writer, options);
 
-            // send it to the StringBuilder object:
-            writer.Flush();
+                // send it to the StringBuilder object:
+                writer.Flush();
+            }
+
+            if (isCSharp)
+            {
+                result.Replace(" class ", " static class ");
+                result.Replace(" partial static ", " static partial ");
+
+                result.Replace(" static System.Guid ", " static readonly System.Guid ");
+            }
 
             return result.ToString();
         }

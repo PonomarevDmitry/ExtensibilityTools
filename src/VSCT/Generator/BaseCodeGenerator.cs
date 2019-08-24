@@ -98,11 +98,14 @@ namespace MadsKristensen.ExtensibilityTools.VSCT.Generator
             {
                 case CodeModelLanguageConstants.vsCMLanguageVB:
                     return CodeDomProvider.CreateProvider("VB");
+
                 case CodeModelLanguageConstants2.vsCMLanguageJSharp:
                     return CodeDomProvider.CreateProvider("VJ#");
+
                 case CodeModelLanguageConstants.vsCMLanguageVC:
                 case CodeModelLanguageConstants.vsCMLanguageMC:
                     return CodeDomProvider.CreateProvider("MC");
+
                 default:
                     return CodeDomProvider.CreateProvider("C#");
             }
